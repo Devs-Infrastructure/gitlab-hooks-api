@@ -524,6 +524,15 @@ async def receive_gitlab_webhook(request: Request):
                 )
                 response.raise_for_status()
                 print(f"[Webhook] Successfully triggered pipeline for project {project_id}.")
+        except httpx.HTTPStatusError as e:
+            error_msg = f"[Webhook] Error triggering pipeline: {e.response.status_code} {e.response.reason_phrase}"
+            try:
+                error_body = e.response.text
+                if error_body:
+                    error_msg += f" - Response: {error_body}"
+            except Exception:
+                pass
+            print(error_msg)
         except Exception as e:
             print(f"[Webhook] Error triggering pipeline: {e}")
     else:

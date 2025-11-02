@@ -1,0 +1,103 @@
+name: Build and Test Docker Image
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Build Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        push: false
+        load: true
+        tags: gitlab-hooks:test
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    - name: Test Docker image - Health endpoint
+      run: |
+        # Start container in background
+        docker run -d -p 8000:8000 --name gitlab-hooks-test gitlab-hooks:test
+        
+        # Wait for container to be ready
+        echo "Waiting for container to start..."
+        sleep 10
+        
+        # Check if container is running
+        if ! docker ps | grep -q gitlab-hooks-test; then
+          echo "Container failed to start"
+          docker logs gitlab-hooks-test
+          exit 1
+        fi
+        
+        # Test health endpoint with retries
+        max_attempts=30
+        attempt=0
+        while [ $attempt -lt $max_attempts ]; do
+          if curl -f http://localhost:8000/health; then
+            echo "Health endpoint responded successfully"
+            break
+          fi
+          attempt=$((attempt + 1))
+          echo "Attempt $attempt/$max_attempts failed, retrying in 2 seconds..."
+          sleep 2
+        done
+        
+        if [ $attempt -eq $max_attempts ]; then
+          echo "Health endpoint failed after $max_attempts attempts"
+          docker logs gitlab-hooks-test
+          exit 1
+        fi
+        
+        # Verify response contains expected content
+        response=$(curl -s http://localhost:8000/health)
+        if echo "$response" | grep -q '"status"'; then
+          echo "Health check passed: $response"
+        else
+          echo "Health check response unexpected: $response"
+          exit 1
+        fi
+        
+        # Cleanup
+        docker stop gitlab-hooks-test
+        docker rm gitlab-hooks-test
+    
+    - name: Build Docker artifact
+      if: github.event_name == 'push'
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        push: false
+        load: true
+        tags: gitlab-hooks:${{ github.sha }},gitlab-hooks:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    - name: Save Docker image as artifact
+      if: github.event_name == 'push'
+      run: |
+        docker save gitlab-hooks:${{ github.sha }} | gzip > gitlab-hooks-image.tar.gz
+    
+    - name: Upload Docker artifact
+      if: github.event_name == 'push'
+      uses: actions/upload-artifact@v4
+      with:
+        name: docker-image
+        path: gitlab-hooks-image.tar.gz
+        retention-days: 7
+

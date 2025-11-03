@@ -1,7 +1,7 @@
 """Application configuration."""
 from decouple import config
 
-GITLAB_HOST = config("GITLAB_HOST", default="https://git.the-devs.com")
+GITLAB_HOST = config("GITLAB_HOST")
 
 MONGO_URL = config(
     "MONGO_URL",

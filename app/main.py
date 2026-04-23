@@ -1,7 +1,5 @@
-import json
 from typing import Optional
 
-import httpx
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
@@ -12,6 +10,7 @@ from app.services.gitlab.exceptions import GitLabAPIError, GitLabAuthenticationE
 from app.database.webhooks import save_or_update_webhook
 from app.connectors import webhooks_collection
 from app.config import CODE_PHRASE
+from app.triggers import get_triggers
 
 app = FastAPI(
     title="GitLab Hooks API",
@@ -540,34 +539,20 @@ async def receive_gitlab_webhook(request: Request):
         ai_flow_input = attrs.get("note") or ""
         input_event = flow_context["event"]
 
-        # --- Send pipeline trigger ---
-        trigger_url = f"https://git.the-devs.com/api/v4/projects/{project_id}/trigger/pipeline"
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    trigger_url,
-                    data={
-                        "token": trigger_token,
-                        "ref": ref,
-                        "variables[AI_FLOW_EVENT]": input_event,
-                        "variables[AI_FLOW_CONTEXT]": json.dumps(flow_context),
-                        "variables[AI_FLOW_INPUT]": ai_flow_input,
-                    },
-                )
-                response.raise_for_status()
-                print(f"[Webhook] Pipeline triggered for {project_id} on {ref}")
-                return response.json()
-        except httpx.HTTPStatusError as e:
-            error_msg = f"[Webhook] Error triggering pipeline: {e.response.status_code} {e.response.reason_phrase}"
-            try:
-                error_body = e.response.text
-                if error_body:
-                    error_msg += f" - Response: {error_body}"
-            except Exception:
-                pass
-            print(error_msg)
-        except Exception as e:
-            print(f"[Webhook] Error triggering pipeline: {e}")
+        # --- Fire configured triggers ---
+        triggers = get_triggers()
+        results = []
+        for trigger in triggers:
+            result = await trigger.fire(
+                project_id=project_id,
+                ref=ref,
+                trigger_token=trigger_token,
+                flow_context=flow_context,
+                ai_flow_input=ai_flow_input,
+                input_event=input_event,
+            )
+            results.append(result)
+        return {"found": found, "trigger_results": results}
     else:
         print("[Webhook] Code phrase not found.")
 

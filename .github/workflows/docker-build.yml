@@ -51,7 +51,9 @@ jobs:
     - name: Test Docker image - Health endpoint
       run: |
         # Start container in background
-        docker run -d -p 8000:8000 --name gitlab-hooks-test gitlab-hooks:test
+        docker run -d -p 8000:8000 --name gitlab-hooks-test \
+          -e GITLAB_HOST=https://gitlab.example.com \
+          gitlab-hooks:test
         
         # Wait for container to be ready
         echo "Waiting for container to start..."

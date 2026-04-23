@@ -1,141 +1,123 @@
 # GitLab Hooks API
 
-A FastAPI-based service for managing GitLab webhooks and automating CI/CD pipeline triggers based on comment-based commands.
+A FastAPI service that listens for GitLab webhook events and dispatches tasks to configurable triggers — GitLab CI pipelines or an OpenClaw agent.
 
-## Overview
+## How It Works
 
-This service provides a centralized API for registering and managing webhooks across multiple GitLab projects within a group. It can automatically trigger GitLab CI/CD pipelines when specific code phrases are detected in comments on merge requests or issues.
-
-## Features
-
-- **Bulk Webhook Registration**: Register webhooks for all projects in a GitLab group (including nested subgroups) with a single API call
-- **Webhook Management**: Automatically detects and updates existing webhooks based on configuration
-- **Comment-Based Pipeline Triggers**: Monitors webhook events and triggers CI/CD pipelines when a configurable code phrase is found in comments
-- **Multiple Event Types**: Supports various GitLab webhook events (push, merge requests, comments, issues, pipelines, etc.)
-- **MongoDB Storage**: Persists webhook configurations and trigger tokens for reliable operation
-- **GitLab API Integration**: Full integration with GitLab API for webhook and pipeline trigger management
-
-## Tech Stack
-
-- **FastAPI** - Modern Python web framework
-- **MongoDB** - Database for storing webhook configurations (via Motor async driver)
-- **httpx** - Async HTTP client for GitLab API calls
-- **Python 3.11+** - Required Python version
-- **Docker** - Containerized deployment support
-
-## Prerequisites
-
-- Python 3.11 or higher
-- MongoDB instance (local or remote)
-- GitLab instance with API access
-- GitLab Personal Access Token (PAT) with appropriate permissions
-
-## Installation
-
-### Using uv (Recommended)
-
-```bash
-# Install dependencies
-uv pip install -e .
-
-# Or install with dev dependencies
-uv pip install -e ".[dev]"
+```
+GitLab comment
+    │  (contains CODE_PHRASE, e.g. "trigger-bot do X")
+    ▼
+POST /gitlab/webhook
+    │  validates X-Gitlab-Token
+    │  extracts project_id, ref, flow_context
+    ▼
+Trigger dispatcher
+    ├─ gitlab_pipeline → triggers GitLab CI pipeline with AI_FLOW_* variables
+    └─ openclaw        → POSTs task + context to OpenClaw agent endpoint
 ```
 
-### Using pip
+### Registration flow
 
-```bash
-pip install -e .
+Before events can be received, webhooks must be registered across all projects in a GitLab group:
+
 ```
+POST /gitlab/register-webhooks
+    │  iterates all projects in group (including nested subgroups)
+    │  creates/updates webhook on each project
+    │  creates pipeline trigger token per project
+    ▼
+MongoDB stores { webhook_token, trigger_tokens: { project_id: token } }
+```
+
+### Webhook processing flow
+
+When GitLab POSTs a webhook event:
+
+1. `X-Gitlab-Token` is validated against MongoDB
+2. Comment text is checked for `CODE_PHRASE`
+3. If found, `flow_context` is assembled:
+   - event type, user, project, merge request metadata, note text, last commit
+4. Configured trigger(s) fire with: `project_id`, `ref`, `trigger_token`, `flow_context`, `AI_FLOW_INPUT`, `AI_FLOW_EVENT`
+
+---
 
 ## Configuration
 
-Configure the application using environment variables:
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `GITLAB_HOST` | yes | — | GitLab instance base URL |
+| `MONGO_URL` | no | `mongodb://root:example@localhost:27017/` | MongoDB connection string |
+| `CODE_PHRASE` | no | `trigger-bot` | Phrase that activates the trigger |
+| `TRIGGER_TYPE` | no | `gitlab_pipeline` | Active trigger(s); comma-separated: `gitlab_pipeline`, `openclaw` |
+| `OPENCLAW_HOST` | openclaw only | — | OpenClaw base URL, e.g. `http://openclaw-1:18789` |
+| `OPENCLAW_OPERATOR_TOKEN` | openclaw only | — | Bearer token for OpenClaw |
+| `OPENCLAW_WEBHOOK_SECRET` | openclaw only | — | `X-OpenClaw-Webhook-Secret` header value |
+| `OPENCLAW_GENERAL_PROMPT` | no | *(built-in agent prompt)* | Prompt prepended to the flow context in OpenClaw messages |
 
-- `GITLAB_HOST` - GitLab instance URL (default: `https://git.the-devs.com`)
-- `MONGO_URL` - MongoDB connection string (default: `mongodb://root:example@localhost:27017/`)
-- `CODE_PHRASE` - Code phrase to detect in comments for triggering pipelines (default: `trigger-bot`)
-
-Create a `.env` file or set these environment variables:
+### `.env` example
 
 ```env
 GITLAB_HOST=https://gitlab.example.com
-MONGO_URL=mongodb://user:password@localhost:27017/
+MONGO_URL=mongodb://root:example@localhost:27017/
 CODE_PHRASE=trigger-bot
+
+# Use both triggers simultaneously
+TRIGGER_TYPE=gitlab_pipeline,openclaw
+
+OPENCLAW_HOST=http://openclaw-1:18789
+OPENCLAW_OPERATOR_TOKEN=your-operator-token
+OPENCLAW_WEBHOOK_SECRET=your-webhook-secret
 ```
 
-## Running the Application
+---
 
-### Development Mode
+## Running
 
 ```bash
-# Using the dev script
+# Development
 uv run dev
 
-# Or directly with uvicorn
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-### Production Mode
-
-```bash
+# Production
 uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
 
-## Docker Deployment
-
-### Using Docker Compose
-
-```bash
-# Start MongoDB and the application
+# Docker Compose (includes MongoDB)
 docker-compose up -d
 ```
 
-### Building Docker Image
+---
+
+## API
+
+### `GET /health`
 
 ```bash
-docker build -t gitlab-hooks .
-docker run -p 8000:8000 \
-  -e GITLAB_HOST=https://gitlab.example.com \
-  -e MONGO_URL=mongodb://mongodb:27017/ \
-  -e CODE_PHRASE=trigger-bot \
-  gitlab-hooks
+curl http://localhost:8000/health
+# {"status":"healthy"}
 ```
 
-## API Endpoints
+### `GET /gitlab/projects?group_id=123`
 
-### Health Check
-
-- `GET /` - Returns API status
-- `GET /health` - Health check endpoint
-
-### GitLab Operations
-
-- `GET /gitlab/projects?group_id={id}` - List all projects in a GitLab group
-  - **Authentication**: Basic Auth (username: any, password: GitLab PAT)
-
-- `POST /gitlab/register-webhooks` - Register or update webhooks for all projects in a group
-  - **Authentication**: Basic Auth (username: any, password: GitLab PAT)
-  - **Request Body**: See `WebhookRegistrationRequest` model for details
-  - **Returns**: Summary of registered, updated, and skipped projects
-
-- `POST /gitlab/webhook` - Receive GitLab webhook events
-  - **Authentication**: Token-based via `X-Gitlab-Token` header
-  - **Functionality**: Detects code phrase in comments and triggers CI/CD pipelines
-
-## Usage Example
-
-### Register Webhooks for a Group
+List all projects in a GitLab group. Basic Auth: any username, GitLab PAT as password.
 
 ```bash
-curl -X POST "http://localhost:8000/gitlab/register-webhooks" \
-  -u "username:your-gitlab-pat" \
+curl -u "user:$GITLAB_PAT" \
+  "http://localhost:8000/gitlab/projects?group_id=123"
+```
+
+### `POST /gitlab/register-webhooks`
+
+Register or update webhooks across every project in a group. Re-running is safe — existing webhooks are compared and updated only if configuration changed.
+
+```bash
+curl -X POST http://localhost:8000/gitlab/register-webhooks \
+  -u "user:$GITLAB_PAT" \
   -H "Content-Type: application/json" \
   -d '{
     "group_id": 123,
-    "webhook_url": "https://your-service.com/gitlab/webhook",
-    "webhook_token": "your-secret-token",
-    "target_trigger_url": "https://gitlab.example.com/api/v4/projects/{project_id}/trigger/pipeline",
+    "webhook_url": "https://hooks.example.com/gitlab/webhook",
+    "webhook_token": "my-secret-token",
+    "target_trigger_url": "unused-kept-for-compat",
     "name": "autowebhook",
     "merge_requests_events": true,
     "note_events": true,
@@ -143,50 +125,128 @@ curl -X POST "http://localhost:8000/gitlab/register-webhooks" \
   }'
 ```
 
-### Configure GitLab Webhook
+**Request fields:**
 
-In your GitLab project settings, add a webhook pointing to:
-```
-https://your-service.com/gitlab/webhook
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `group_id` | yes | — | GitLab group ID |
+| `webhook_url` | yes | — | Public URL of this service's `/gitlab/webhook` endpoint |
+| `webhook_token` | yes | — | Secret sent in `X-Gitlab-Token` by GitLab |
+| `name` | yes | — | Webhook name used to identify existing webhooks (e.g. `autowebhook`) |
+| `target_trigger_url` | yes | — | Kept for schema compatibility |
+| `enable_ssl_verification` | no | `true` | SSL verification on GitLab's outbound request |
+| `merge_requests_events` | no | `false` | |
+| `note_events` | no | `false` | Comments on MRs/issues |
+| `push_events` | no | `false` | |
+| `issues_events` | no | `false` | |
+| `pipeline_events` | no | `false` | |
+| `tag_push_events` | no | `false` | |
+| `deployment_events` | no | `false` | |
+| `releases_events` | no | `false` | |
+| `wiki_page_events` | no | `false` | |
+| `job_events` | no | `false` | |
+
+**Response:**
+
+```json
+{
+  "registered": [{"project_id": 42, "name": "my-repo"}],
+  "updated":    [],
+  "skipped":    [{"project_id": 7,  "name": "other-repo"}],
+  "failed":     []
+}
 ```
 
-Set the secret token to match the `webhook_token` used during registration.
+### `POST /gitlab/webhook`
+
+Receives GitLab webhook events. Called by GitLab, not directly.
+
+**Headers required by GitLab:**
+- `X-Gitlab-Token: <webhook_token>`
+
+**Response when code phrase found:**
+
+```json
+{
+  "found": true,
+  "trigger_results": [
+    { "id": 999, "status": "created" }
+  ]
+}
+```
+
+**Response when code phrase not found:**
+
+```json
+{ "found": false }
+```
+
+---
+
+## Triggers
+
+### `gitlab_pipeline`
+
+Calls the GitLab pipeline trigger API. The pipeline receives three CI variables:
+
+| Variable | Content |
+|---|---|
+| `AI_FLOW_EVENT` | Event type, e.g. `note` |
+| `AI_FLOW_CONTEXT` | JSON: event, user, project, MR, note, commit |
+| `AI_FLOW_INPUT` | Raw comment text |
+
+Equivalent curl:
+```bash
+curl -X POST "$GITLAB_HOST/api/v4/projects/$PROJECT_ID/trigger/pipeline" \
+  -F "token=$TRIGGER_TOKEN" \
+  -F "ref=$BRANCH" \
+  -F "variables[AI_FLOW_EVENT]=note" \
+  -F "variables[AI_FLOW_CONTEXT]={...}" \
+  -F "variables[AI_FLOW_INPUT]=trigger-bot fix the tests"
+```
+
+### `openclaw`
+
+Posts the flow context to an OpenClaw agent endpoint as a task message.
+
+```bash
+curl -X POST "$OPENCLAW_HOST/plugins/webhooks/trigger" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENCLAW_OPERATOR_TOKEN" \
+  -H "X-OpenClaw-Webhook-Secret: $OPENCLAW_WEBHOOK_SECRET" \
+  -d '{"message": "<OPENCLAW_GENERAL_PROMPT>\n\n<flow_context as JSON>"}'
+```
+
+The message is: `OPENCLAW_GENERAL_PROMPT` + newline + the full `flow_context` JSON. The default `OPENCLAW_GENERAL_PROMPT` instructs the agent to read the GitLab context, perform the requested action using GitLab MCP, and post results back as a GitLab comment.
+
+### Multi-trigger
+
+Set `TRIGGER_TYPE=gitlab_pipeline,openclaw` to fire both sequentially on every matching comment.
+
+---
 
 ## Project Structure
 
 ```
-gitlab-hooks/
-├── app/
-│   ├── main.py              # FastAPI application and endpoints
-│   ├── config.py            # Configuration management
-│   ├── connectors.py        # MongoDB connection
-│   ├── database/
-│   │   └── webhooks.py      # Webhook database operations
-│   └── services/
-│       └── gitlab/
-│           ├── client.py    # GitLab API client
-│           └── exceptions.py # Custom exceptions
-├── docker-compose.yml       # Docker Compose configuration
-├── Dockerfile              # Docker image definition
-├── pyproject.toml          # Project dependencies and metadata
-└── dev.py                  # Development server script
+app/
+├── main.py              # FastAPI routes
+├── config.py            # All environment variable definitions
+├── connectors.py        # MongoDB client
+├── database/
+│   └── webhooks.py      # Upsert logic
+├── services/
+│   └── gitlab/
+│       ├── client.py    # GitLab API client (projects, hooks, triggers)
+│       └── exceptions.py
+└── triggers/
+    ├── __init__.py      # get_triggers() factory, reads TRIGGER_TYPE
+    ├── base.py          # BaseTrigger abstract class
+    ├── gitlab_pipeline.py
+    └── openclaw.py
 ```
 
-## How It Works
-
-1. **Webhook Registration**: When you call `/gitlab/register-webhooks`, the service:
-   - Fetches all projects in the specified GitLab group (including nested subgroups)
-   - Creates or updates webhooks for each project
-   - Creates pipeline trigger tokens for each project
-   - Stores the configuration in MongoDB
-
-2. **Webhook Processing**: When GitLab sends a webhook event to `/gitlab/webhook`:
-   - The service validates the webhook token
-   - Checks if the code phrase appears in comment content
-   - If found, triggers the GitLab CI/CD pipeline using the stored trigger token
-   - Passes webhook context as pipeline variables (`AI_FLOW_EVENT`, `AI_FLOW_CONTEXT`, `AI_FLOW_INPUT`)
+---
 
 ## License
 
-This project is proprietary software.
-
+GNU GPL v3. See [LICENSE](LICENSE).

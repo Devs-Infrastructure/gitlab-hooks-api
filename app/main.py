@@ -242,16 +242,18 @@ async def register_webhooks(
         registered = []
         updated = []
         skipped = []
+        failed = []
         trigger_tokens = {}  # Store project_id -> trigger_token mapping
 
         # Check each project for existing autowebhook
         for project in all_projects:
             project_id = project["id"]
+            project_name = project.get("name", str(project_id))
 
             try:
                 # Get pipeline trigger tokens for the project
                 triggers = await gitlab_client.get_project_triggers(token, project_id)
-                
+
                 # Find existing trigger token with description == request.name
                 existing_trigger = None
                 for trigger in triggers:
@@ -259,7 +261,7 @@ async def register_webhooks(
                     if trigger_description == request.name:
                         existing_trigger = trigger
                         break
-                
+
                 # If trigger token not found, create it
                 if not existing_trigger:
                     new_trigger = await gitlab_client.create_project_trigger(
@@ -272,8 +274,7 @@ async def register_webhooks(
                     trigger_tokens[project_id] = existing_trigger.get("token")
 
             except GitLabAPIError as e:
-                # If we can't process triggers for a project, skip it
-                pass
+                print(f"[Register] project {project_id} ({project_name}): trigger token error: {e}")
 
             try:
                 # Get existing hooks for the project
@@ -286,7 +287,7 @@ async def register_webhooks(
                     hook_token = hook.get("token")
                     hook_url = hook.get("url", "")
                     hook_description = hook.get("description", "")
-                    
+
                     # Primary: match by name (description field in GitLab API)
                     if hook_description == request.name:
                         existing_hook = hook
@@ -302,23 +303,21 @@ async def register_webhooks(
 
                 if existing_hook:
                     # Compare existing hook settings with requested settings
-                    needs_update = False
+                    diffs = []
                     for field, requested_value in event_fields_map.items():
                         existing_value = existing_hook.get(field, False)
                         if existing_value != requested_value:
-                            needs_update = True
-                            break
+                            diffs.append(f"{field}: {existing_value} -> {requested_value}")
 
-                    # Also check if URL, token, or name changed
                     if existing_hook.get("url") != request.webhook_url:
-                        needs_update = True
+                        diffs.append(f"url: {existing_hook.get('url')} -> {request.webhook_url}")
                     if existing_hook.get("token") != request.webhook_token:
-                        needs_update = True
+                        diffs.append("token changed")
                     if existing_hook.get("description") != request.name:
-                        needs_update = True
+                        diffs.append(f"description: {existing_hook.get('description')} -> {request.name}")
 
-                    if needs_update:
-                        # Update the webhook
+                    if diffs:
+                        print(f"[Register] project {project_id} ({project_name}): updating webhook, changes: {', '.join(diffs)}")
                         await gitlab_client.update_project_hook(
                             token=token,
                             project_id=project_id,
@@ -341,9 +340,10 @@ async def register_webhooks(
                         )
                         updated.append(project_id)
                     else:
+                        print(f"[Register] project {project_id} ({project_name}): webhook up to date, skipping")
                         skipped.append(project_id)
                 else:
-                    # Create the webhook
+                    print(f"[Register] project {project_id} ({project_name}): no existing webhook, creating")
                     await gitlab_client.create_project_hook(
                         token=token,
                         project_id=project_id,
@@ -366,8 +366,8 @@ async def register_webhooks(
                     registered.append(project_id)
 
             except GitLabAPIError as e:
-                # If we can't process a project, skip it
-                skipped.append(project_id)
+                print(f"[Register] project {project_id} ({project_name}): webhook error: {e}")
+                failed.append({"project_id": project_id, "error": str(e)})
 
         # Save webhook data to MongoDB after successful registration
         # Convert trigger_tokens keys from int to str for MongoDB (BSON requires string keys)
@@ -425,6 +425,7 @@ async def register_webhooks(
             "registered": registered,
             "updated": updated,
             "skipped": skipped,
+            "failed": failed,
             "trigger_tokens": trigger_tokens,
             "pagination": pagination_info,
         }

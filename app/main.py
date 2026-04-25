@@ -243,6 +243,7 @@ async def register_webhooks(
         updated = []
         skipped = []
         failed = []
+        trigger_token_errors = []
         trigger_tokens = {}  # Store project_id -> trigger_token mapping
 
         # Check each project for existing autowebhook
@@ -275,6 +276,7 @@ async def register_webhooks(
 
             except GitLabAPIError as e:
                 print(f"[Register] project {project_id} ({project_name}): trigger token error: {e}")
+                trigger_token_errors.append({"project_id": project_id, "error": str(e)})
 
             try:
                 # Get existing hooks for the project
@@ -426,6 +428,7 @@ async def register_webhooks(
             "updated": updated,
             "skipped": skipped,
             "failed": failed,
+            "trigger_token_errors": trigger_token_errors,
             "trigger_tokens": trigger_tokens,
             "pagination": pagination_info,
         }
@@ -478,11 +481,20 @@ async def receive_gitlab_webhook(request: Request):
             print("[Webhook] Project ID not found in webhook payload.")
             return {"found": found}
         
-        # Get trigger token for this project
-        trigger_tokens = webhook["data"].get("trigger_tokens", {})
-        trigger_token = trigger_tokens.get(str(project_id))
+        # Get trigger token for this project.
+        # Look up by both webhook_token AND project_id to handle multiple group documents
+        # sharing the same webhook_token.
+        project_webhook = await webhooks_collection.find_one({
+            "data.webhook_token": token,
+            f"data.trigger_tokens.{project_id}": {"$exists": True},
+        })
+        trigger_token = (
+            project_webhook["data"]["trigger_tokens"].get(str(project_id))
+            if project_webhook else None
+        )
         if not trigger_token:
-            print(f"[Webhook] Trigger token not found for project {project_id}.")
+            print(f"[Webhook] Trigger token not found for project {project_id}. "
+                  f"Webhook token matched but no trigger token registered for this project.")
             return {"found": found}
         
         # Extract ref from webhook payload

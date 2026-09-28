@@ -7,3 +7,5 @@ client = AsyncIOMotorClient(MONGO_URL)
 db = client["gitlab"]
 webhooks_collection = db["webhooks"]
 
+opencode_sessions_collection = db["opencode_sessions"]
+opencode_events_collection = db["opencode_events"]

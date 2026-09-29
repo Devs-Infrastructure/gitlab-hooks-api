@@ -9,7 +9,6 @@ from app.services.gitlab import GitLabClient
 from app.services.gitlab.exceptions import GitLabAPIError, GitLabAuthenticationError
 from app.database.webhooks import save_or_update_webhook
 from app.connectors import webhooks_collection
-from app.config import CODE_PHRASE
 from app.triggers import get_triggers
 
 app = FastAPI(
@@ -470,11 +469,12 @@ async def receive_gitlab_webhook(request: Request):
     # GitLab comment events typically have the note in object_attributes.note
     note = body.get("object_attributes", {}).get("note", "")
     
-    # Check if code phrase is in the comment
-    found = CODE_PHRASE in note
+    # Each trigger decides whether the comment is meant for it
+    triggers = [t for t in get_triggers() if t.matches(note)]
+    found = bool(triggers)
 
     if found:
-        print("[Webhook] Code phrase found in comment.")
+        print(f"[Webhook] Comment matched triggers: {[type(t).__name__ for t in triggers]}")
         # Extract project ID from webhook payload
         project_id = body.get("project", {}).get("id")
         if not project_id:
@@ -495,7 +495,6 @@ async def receive_gitlab_webhook(request: Request):
         if not trigger_token:
             print(f"[Webhook] Trigger token not found for project {project_id}. "
                   f"Webhook token matched but no trigger token registered for this project.")
-            return {"found": found}
         
         # Extract ref from webhook payload
         # For merge request events, try target_branch or source_branch
@@ -538,6 +537,8 @@ async def receive_gitlab_webhook(request: Request):
                 "url": mr.get("url") or mr.get("web_url"),
             },
             "note": {
+                "id": attrs.get("id"),
+                "noteable_type": attrs.get("noteable_type"),
                 "text": attrs.get("note"),
                 "url": attrs.get("url"),
                 "action": attrs.get("action"),
@@ -552,8 +553,7 @@ async def receive_gitlab_webhook(request: Request):
         ai_flow_input = attrs.get("note") or ""
         input_event = flow_context["event"]
 
-        # --- Fire configured triggers ---
-        triggers = get_triggers()
+        # --- Fire matching triggers ---
         results = []
         for trigger in triggers:
             result = await trigger.fire(
@@ -567,7 +567,7 @@ async def receive_gitlab_webhook(request: Request):
             results.append(result)
         return {"found": found, "trigger_results": results}
     else:
-        print("[Webhook] Code phrase not found.")
+        print("[Webhook] No trigger phrase found.")
 
     return {"found": found}
 

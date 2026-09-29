@@ -1,6 +1,6 @@
 # GitLab Hooks API
 
-A FastAPI service that listens for GitLab webhook events and dispatches tasks to configurable triggers — GitLab CI pipelines or an OpenClaw agent.
+A FastAPI service that listens for GitLab webhook events and dispatches tasks to configurable triggers — GitLab CI pipelines or an OpenCode server.
 
 ## How It Works
 
@@ -14,7 +14,7 @@ POST /gitlab/webhook
     ▼
 Trigger dispatcher
     ├─ gitlab_pipeline → triggers GitLab CI pipeline with AI_FLOW_* variables
-    └─ openclaw        → POSTs task + context to OpenClaw agent endpoint
+    └─ opencode        → MR comments starting with "boss" → per-MR OpenCode session
 ```
 
 ### Registration flow
@@ -35,7 +35,7 @@ MongoDB stores { webhook_token, trigger_tokens: { project_id: token } }
 When GitLab POSTs a webhook event:
 
 1. `X-Gitlab-Token` is validated against MongoDB
-2. Comment text is checked for `CODE_PHRASE`
+2. Each configured trigger checks the comment: `CODE_PHRASE` anywhere (`gitlab_pipeline`) or a leading `OPENCODE_TRIGGER_PHRASE` (`opencode`)
 3. If found, `flow_context` is assembled:
    - event type, user, project, merge request metadata, note text, last commit
 4. Configured trigger(s) fire with: `project_id`, `ref`, `trigger_token`, `flow_context`, `AI_FLOW_INPUT`, `AI_FLOW_EVENT`
@@ -49,11 +49,15 @@ When GitLab POSTs a webhook event:
 | `GITLAB_HOST` | yes | — | GitLab instance base URL |
 | `MONGO_URL` | no | `mongodb://root:example@localhost:27017/` | MongoDB connection string |
 | `CODE_PHRASE` | no | `trigger-bot` | Phrase that activates the trigger |
-| `TRIGGER_TYPE` | no | `gitlab_pipeline` | Active trigger(s); comma-separated: `gitlab_pipeline`, `openclaw` |
-| `OPENCLAW_HOST` | openclaw only | — | OpenClaw base URL, e.g. `http://openclaw-1:18789` |
-| `OPENCLAW_OPERATOR_TOKEN` | openclaw only | — | Bearer token for OpenClaw |
-| `OPENCLAW_WEBHOOK_SECRET` | openclaw only | — | `X-OpenClaw-Webhook-Secret` header value |
-| `OPENCLAW_GENERAL_PROMPT` | no | *(built-in agent prompt)* | Prompt prepended to the flow context in OpenClaw messages |
+| `TRIGGER_TYPE` | no | `gitlab_pipeline` | Active trigger(s); comma-separated: `gitlab_pipeline`, `opencode` |
+| `OPENCODE_HOST` | opencode only | — | OpenCode server URL (`opencode serve`), e.g. `http://opencode:4096` |
+| `OPENCODE_USERNAME` / `OPENCODE_PASSWORD` | no | `opencode` / — | Basic auth for the OpenCode server (`OPENCODE_SERVER_PASSWORD`) |
+| `OPENCODE_TRIGGER_PHRASE` | no | `boss` | MR comments must start with this word |
+| `OPENCODE_DIRECTORY` | no | *(server cwd)* | Per-repo checkout, e.g. `/workspace/{path_with_namespace}`. When empty, OpenCode clones the repo under its cwd |
+| `OPENCODE_AGENT` | no | *(default agent)* | OpenCode agent name |
+| `OPENCODE_MODEL` | no | *(default model)* | `provider/model` |
+| `OPENCODE_RUN_TIMEOUT` | no | `3600` | Seconds to wait for a run to finish before sending the next request for the same MR |
+| `OPENCODE_INITIAL_PROMPT` / `OPENCODE_FOLLOWUP_PROMPT` | no | *(built-in)* | Prompt templates; placeholders `{mr_url}`, `{mr_iid}`, `{source_branch}`, `{path_with_namespace}`, `{repo_dir}`, `{worktree}`, `{request}` |
 
 ### `.env` example
 
@@ -63,11 +67,10 @@ MONGO_URL=mongodb://root:example@localhost:27017/
 CODE_PHRASE=trigger-bot
 
 # Use both triggers simultaneously
-TRIGGER_TYPE=gitlab_pipeline,openclaw
+TRIGGER_TYPE=gitlab_pipeline,opencode
 
-OPENCLAW_HOST=http://openclaw-1:18789
-OPENCLAW_OPERATOR_TOKEN=your-operator-token
-OPENCLAW_WEBHOOK_SECRET=your-webhook-secret
+OPENCODE_HOST=http://opencode:4096
+OPENCODE_PASSWORD=your-opencode-server-password
 ```
 
 ---
@@ -205,23 +208,21 @@ curl -X POST "$GITLAB_HOST/api/v4/projects/$PROJECT_ID/trigger/pipeline" \
   -F "variables[AI_FLOW_INPUT]=trigger-bot fix the tests"
 ```
 
-### `openclaw`
+### `opencode`
 
-Posts the flow context to an OpenClaw agent endpoint as a task message.
+Drives an OpenCode server through its HTTP API. Only comments on merge requests that **start with** `OPENCODE_TRIGGER_PHRASE` (default `boss`) are handled, e.g. `boss fix the failing test`.
 
-```bash
-curl -X POST "$OPENCLAW_HOST/plugins/webhooks/trigger" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $OPENCLAW_OPERATOR_TOKEN" \
-  -H "X-OpenClaw-Webhook-Secret: $OPENCLAW_WEBHOOK_SECRET" \
-  -d '{"message": "<OPENCLAW_GENERAL_PROMPT>\n\n<flow_context as JSON>"}'
-```
+- **One session per MR.** `project_id + mr_iid → session_id` is stored in MongoDB (`opencode_sessions`) and reused. If the session no longer exists on the server, a new one is created.
+- **First request** creates the session (`POST /session`) and sends the initial instruction via `POST /session/:id/prompt_async`: read the MR with `glab`, create/reuse `.worktrees/mr-<iid>-<source-branch>`, verify it is on the MR source branch, do the smallest change, test, commit and push to the MR branch.
+- **Later requests** reuse the session with `New instruction for <MR_URL>: <request>. Refresh relevant context with glab and continue in the existing MR worktree.`
+- **Retries are deduplicated** by GitLab note id (`opencode_events` collection).
+- **Requests are serialized per MR**: the webhook returns `{"status": "queued"}` immediately; a background worker sends the next prompt only after the session is idle again (polled via `GET /session/status`). The queue lives in memory, so run a single uvicorn worker and note that queued-but-unsent requests are lost on restart.
 
-The message is: `OPENCLAW_GENERAL_PROMPT` + newline + the full `flow_context` JSON. The default `OPENCLAW_GENERAL_PROMPT` instructs the agent to read the GitLab context, perform the requested action using GitLab MCP, and post results back as a GitLab comment.
+The OpenCode host needs the repository checked out (see `OPENCODE_DIRECTORY`) and an authenticated `glab`.
 
 ### Multi-trigger
 
-Set `TRIGGER_TYPE=gitlab_pipeline,openclaw` to fire both sequentially on every matching comment.
+Set `TRIGGER_TYPE=gitlab_pipeline,opencode` to enable both; each fires only for comments it matches.
 
 ---
 
@@ -233,16 +234,19 @@ app/
 ├── config.py            # All environment variable definitions
 ├── connectors.py        # MongoDB client
 ├── database/
-│   └── webhooks.py      # Upsert logic
+│   ├── webhooks.py      # Upsert logic
+│   └── opencode.py      # MR → session mapping, event dedup
 ├── services/
-│   └── gitlab/
-│       ├── client.py    # GitLab API client (projects, hooks, triggers)
-│       └── exceptions.py
+│   ├── gitlab/
+│   │   ├── client.py    # GitLab API client (projects, hooks, triggers)
+│   │   └── exceptions.py
+│   └── opencode/
+│       └── client.py    # OpenCode server HTTP API client
 └── triggers/
     ├── __init__.py      # get_triggers() factory, reads TRIGGER_TYPE
     ├── base.py          # BaseTrigger abstract class
     ├── gitlab_pipeline.py
-    └── openclaw.py
+    └── opencode.py
 ```
 
 ---

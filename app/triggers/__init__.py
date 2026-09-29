@@ -1,17 +1,17 @@
 """Trigger registry.
 
 TRIGGER_TYPE env var controls which triggers are active.
-Accepts comma-separated values: "gitlab_pipeline", "openclaw".
-Example: TRIGGER_TYPE=gitlab_pipeline,openclaw
+Accepts comma-separated values: "gitlab_pipeline", "opencode".
+Example: TRIGGER_TYPE=gitlab_pipeline,opencode
 """
 from app.config import TRIGGER_TYPE
 from app.triggers.base import BaseTrigger
 from app.triggers.gitlab_pipeline import GitLabPipelineTrigger
-from app.triggers.openclaw import OpenClawTrigger
+from app.triggers.opencode import OpenCodeTrigger
 
 _REGISTRY: dict[str, type[BaseTrigger]] = {
     "gitlab_pipeline": GitLabPipelineTrigger,
-    "openclaw": OpenClawTrigger,
+    "opencode": OpenCodeTrigger,
 }
 
 

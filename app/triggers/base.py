@@ -1,8 +1,13 @@
 """Abstract base class for all pipeline triggers."""
 import abc
 
+from app.config import CODE_PHRASE
+
 
 class BaseTrigger(abc.ABC):
+    def matches(self, note: str) -> bool:
+        return CODE_PHRASE in (note or "")
+
     @abc.abstractmethod
     async def fire(
         self,

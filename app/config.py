@@ -24,6 +24,12 @@ OPENCODE_AGENT     = config("OPENCODE_AGENT", default="")
 # "provider/model"
 OPENCODE_MODEL     = config("OPENCODE_MODEL", default="")
 OPENCODE_RUN_TIMEOUT = config("OPENCODE_RUN_TIMEOUT", default=3600, cast=int)
+# Seconds to wait for a sent prompt to start running before reporting failure.
+OPENCODE_START_TIMEOUT = config("OPENCODE_START_TIMEOUT", default=60, cast=int)
+# Link posted in MR replies; placeholders {session_id}, {directory}. Empty = id only.
+OPENCODE_SESSION_URL = config("OPENCODE_SESSION_URL", default="")
+# GitLab token (api scope) used to reply to the triggering MR comment. Empty = no replies.
+OPENCODE_GITLAB_TOKEN = config("OPENCODE_GITLAB_TOKEN", default="")
 
 OPENCODE_INITIAL_PROMPT = config("OPENCODE_INITIAL_PROMPT", default=(
     "Work on {mr_url}. Use glab to read the MR, comments, discussions, diff and CI. "

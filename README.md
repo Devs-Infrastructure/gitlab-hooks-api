@@ -57,6 +57,9 @@ When GitLab POSTs a webhook event:
 | `OPENCODE_AGENT` | no | *(default agent)* | OpenCode agent name |
 | `OPENCODE_MODEL` | no | *(default model)* | `provider/model` |
 | `OPENCODE_RUN_TIMEOUT` | no | `3600` | Seconds to wait for a run to finish before sending the next request for the same MR |
+| `OPENCODE_START_TIMEOUT` | no | `60` | Seconds to wait for a sent prompt to start running before it is reported as failed |
+| `OPENCODE_GITLAB_TOKEN` | no | — | GitLab token (`api` scope) used to reply to the triggering comment with the session link or failure. Empty = no replies |
+| `OPENCODE_SESSION_URL` | no | — | Session link template for those replies; placeholders `{session_id}`, `{directory}`, e.g. `https://coder.the-devs.com/server/<base64 server URL>/session/{session_id}`. Empty = session id only |
 | `OPENCODE_INITIAL_PROMPT` / `OPENCODE_FOLLOWUP_PROMPT` | no | *(built-in)* | Prompt templates; placeholders `{mr_url}`, `{mr_iid}`, `{source_branch}`, `{path_with_namespace}`, `{repo_dir}`, `{worktree}`, `{request}` |
 
 ### `.env` example
@@ -217,6 +220,11 @@ Drives an OpenCode server through its HTTP API. Only comments on merge requests 
 - **Later requests** reuse the session with `New instruction for <MR_URL>: <request>. Refresh relevant context with glab and continue in the existing MR worktree.`
 - **Retries are deduplicated** by GitLab note id (`opencode_events` collection).
 - **Requests are serialized per MR**: the webhook returns `{"status": "queued"}` immediately; a background worker sends the next prompt only after the session is idle again (polled via `GET /session/status`). The queue lives in memory, so run a single uvicorn worker and note that queued-but-unsent requests are lost on restart.
+
+- **Status replies** (requires `OPENCODE_GITLAB_TOKEN`): the bot answers in the thread of the triggering comment with
+  - `⏳ Queued (#N)` immediately, when another request for the MR is still running;
+  - `🚀 OpenCode started working on this in session <link>` as soon as the session is busy (or has replied);
+  - `❌ OpenCode failed ...` when the server is unreachable, the session can't be created, the reply errors (e.g. provider auth), nothing starts within `OPENCODE_START_TIMEOUT`, or the run ends with an error.
 
 The OpenCode host needs the repository checked out (see `OPENCODE_DIRECTORY`) and an authenticated `glab`.
 

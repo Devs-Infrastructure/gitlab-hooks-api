@@ -538,6 +538,7 @@ async def receive_gitlab_webhook(request: Request):
             },
             "note": {
                 "id": attrs.get("id"),
+                "discussion_id": attrs.get("discussion_id"),
                 "noteable_type": attrs.get("noteable_type"),
                 "text": attrs.get("note"),
                 "url": attrs.get("url"),

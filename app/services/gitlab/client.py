@@ -384,3 +384,40 @@ class GitLabClient:
             except httpx.RequestError as e:
                 raise GitLabAPIError(f"Network error: {str(e)}") from e
 
+
+    async def create_mr_note(
+        self,
+        token: str,
+        project_id: int,
+        mr_iid: int,
+        body: str,
+        discussion_id: Optional[str] = None,
+    ) -> dict:
+        """Comment on a merge request, as a reply in `discussion_id` when given.
+
+        Raises:
+            GitLabAuthenticationError: If authentication fails
+            GitLabAPIError: If the API request fails
+        """
+        url = f"{self.api_base}/projects/{project_id}/merge_requests/{mr_iid}"
+        url += f"/discussions/{discussion_id}/notes" if discussion_id else "/notes"
+        headers = {"Authorization": f"Bearer {token}"}
+
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(
+                    url, headers=headers, json={"body": body}, timeout=30.0
+                )
+                response.raise_for_status()
+                return response.json()
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 401:
+                    raise GitLabAuthenticationError(
+                        "Invalid GitLab personal access token"
+                    )
+                raise GitLabAPIError(
+                    f"GitLab API error: {e.response.text}",
+                    status_code=e.response.status_code,
+                )
+            except httpx.RequestError as e:
+                raise GitLabAPIError(f"Network error: {str(e)}") from e

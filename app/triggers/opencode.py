@@ -7,12 +7,16 @@ from app.config import (
     OPENCODE_AGENT,
     OPENCODE_DIRECTORY,
     OPENCODE_FOLLOWUP_PROMPT,
+    OPENCODE_GITLAB_TOKEN,
     OPENCODE_INITIAL_PROMPT,
     OPENCODE_MODEL,
     OPENCODE_RUN_TIMEOUT,
+    OPENCODE_SESSION_URL,
+    OPENCODE_START_TIMEOUT,
     OPENCODE_TRIGGER_PHRASE,
 )
 from app.database.opencode import claim_event, get_mr_session, save_mr_session
+from app.services.gitlab import GitLabClient
 from app.services.opencode import OpenCodeClient
 from app.triggers.base import BaseTrigger
 
@@ -31,6 +35,13 @@ def worktree_path(repo_dir: str, mr_iid: int, source_branch: str) -> str:
     return worktree if repo_dir == "." else f"{repo_dir}/{worktree}"
 
 
+def session_link(session_id: str, directory: str | None) -> str:
+    if not OPENCODE_SESSION_URL:
+        return f"`{session_id}`"
+    url = OPENCODE_SESSION_URL.format(session_id=session_id, directory=directory or "")
+    return f"[`{session_id}`]({url})"
+
+
 class OpenCodeTrigger(BaseTrigger):
     """Sends MR instructions to a per-MR OpenCode session via `prompt_async`."""
 
@@ -42,13 +53,19 @@ class OpenCodeTrigger(BaseTrigger):
         agent: str = OPENCODE_AGENT,
         model: str = OPENCODE_MODEL,
         run_timeout: int = OPENCODE_RUN_TIMEOUT,
+        start_timeout: int = OPENCODE_START_TIMEOUT,
+        gitlab: GitLabClient | None = None,
+        gitlab_token: str = OPENCODE_GITLAB_TOKEN,
     ):
         self._client = client or OpenCodeClient()
+        self._gitlab = gitlab or GitLabClient()
+        self._gitlab_token = gitlab_token
         self._pattern = _phrase_pattern(phrase)
         self._directory_template = directory_template
         self._agent = agent or None
         self._model = model or None
         self._run_timeout = run_timeout
+        self._start_timeout = start_timeout
 
     def matches(self, note: str) -> bool:
         return bool(self._pattern.match(note or ""))
@@ -85,11 +102,30 @@ class OpenCodeTrigger(BaseTrigger):
             "mr_url": mr.get("url") or "",
             "source_branch": mr.get("source_branch") or ref,
             "request": request,
+            "discussion_id": note.get("discussion_id"),
         }
         mr_key = f"{project_id}:{mr['iid']}"
+        worker = _workers.get(mr_key)
+        waiting = worker is not None and not worker.done()
         position = self._enqueue(mr_key, job)
         print(f"[OpenCodeTrigger] Queued request for MR {mr_key} (position {position}).")
+        if waiting:
+            await self._reply(job, f"⏳ Queued (#{position}): OpenCode is still working on "
+                                   f"a previous request for this MR.")
         return {"status": "queued", "merge_request": mr_key, "position": position}
+
+    async def _reply(self, job: dict, text: str):
+        """Answer the triggering MR comment. Never raises."""
+        if not self._gitlab_token:
+            return
+        try:
+            await self._gitlab.create_mr_note(
+                self._gitlab_token, job["project_id"], job["mr_iid"], text,
+                discussion_id=job.get("discussion_id"),
+            )
+        except Exception as e:
+            print(f"[OpenCodeTrigger] MR {job['project_id']}:{job['mr_iid']}: "
+                  f"failed to post reply: {e}")
 
     def _enqueue(self, mr_key: str, job: dict) -> int:
         queue = _queues.setdefault(mr_key, deque())
@@ -107,6 +143,9 @@ class OpenCodeTrigger(BaseTrigger):
                 await self._process(job)
             except Exception as e:
                 print(f"[OpenCodeTrigger] MR {mr_key}: failed to process request: {e}")
+                session = job.get("session_id")
+                where = f" (session {session_link(session, job.get('directory'))})" if session else ""
+                await self._reply(job, f"❌ OpenCode failed{where}: {e}")
         _queues.pop(mr_key, None)
         _workers.pop(mr_key, None)
 
@@ -149,15 +188,33 @@ class OpenCodeTrigger(BaseTrigger):
             text = OPENCODE_INITIAL_PROMPT.format(**prompt_vars)
             print(f"[OpenCodeTrigger] MR {project_id}:{mr_iid}: created session {session_id}")
 
+        job["session_id"], job["directory"] = session_id, directory
+        link = session_link(session_id, directory)
+
         if not await self._client.wait_until_idle(session_id, directory, timeout=self._run_timeout):
             print(f"[OpenCodeTrigger] Session {session_id} still busy after "
                   f"{self._run_timeout}s, sending anyway.")
 
+        known_ids = await self._client.message_ids(session_id, directory)
         await self._client.prompt_async(
             session_id, text, directory=directory, agent=self._agent, model=self._model
         )
         print(f"[OpenCodeTrigger] MR {project_id}:{mr_iid}: prompt sent to {session_id}")
 
-        if await self._client.wait_until_busy(session_id, directory):
-            await self._client.wait_until_idle(session_id, directory, timeout=self._run_timeout)
+        error = await self._client.wait_until_started(
+            session_id, known_ids, directory, timeout=self._start_timeout
+        )
+        if error:
+            print(f"[OpenCodeTrigger] MR {project_id}:{mr_iid}: session {session_id} failed: {error}")
+            await self._reply(job, f"❌ OpenCode failed to start in session {link}: {error}")
+            return
+        print(f"[OpenCodeTrigger] MR {project_id}:{mr_iid}: session {session_id} started")
+        await self._reply(job, f"🚀 OpenCode started working on this in session {link}.")
+
+        await self._client.wait_until_idle(session_id, directory, timeout=self._run_timeout)
+        error = await self._client.last_error(session_id, directory)
+        if error:
+            print(f"[OpenCodeTrigger] MR {project_id}:{mr_iid}: session {session_id} failed: {error}")
+            await self._reply(job, f"❌ OpenCode run failed in session {link}: {error}")
+            return
         print(f"[OpenCodeTrigger] MR {project_id}:{mr_iid}: session {session_id} finished")

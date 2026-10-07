@@ -99,17 +99,49 @@ class OpenCodeClient:
             await asyncio.sleep(poll_interval)
         return False
 
-    async def wait_until_busy(
+    async def list_messages(self, session_id: str, directory: Optional[str] = None) -> list[dict]:
+        """Session messages as `[{"info": {...}, "parts": [...]}]`, oldest first."""
+        response = await self._request("GET", f"/session/{session_id}/message", directory)
+        return response.json()
+
+    async def message_ids(self, session_id: str, directory: Optional[str] = None) -> set[str]:
+        return {m["info"]["id"] for m in await self.list_messages(session_id, directory)}
+
+    async def last_error(self, session_id: str, directory: Optional[str] = None) -> Optional[str]:
+        """Error of the latest assistant message, if that run failed."""
+        messages = await self.list_messages(session_id, directory)
+        assistant = [m["info"] for m in messages if m["info"].get("role") == "assistant"]
+        return _error_text(assistant[-1]) if assistant else None
+
+    async def wait_until_started(
         self,
         session_id: str,
+        known_message_ids: set[str],
         directory: Optional[str] = None,
-        timeout: float = 30,
+        timeout: float = 60,
         poll_interval: float = 1,
-    ) -> bool:
-        """Poll until the session starts running. Returns False if it never did within timeout."""
+    ) -> Optional[str]:
+        """Poll until the prompt sent after `known_message_ids` starts running.
+
+        Returns None once the session is busy or produced a reply, the error text if
+        the reply failed, or a timeout message if nothing happened.
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if await self.is_busy(session_id, directory):
-                return True
+                return None
+            replies = [
+                m["info"] for m in await self.list_messages(session_id, directory)
+                if m["info"]["id"] not in known_message_ids and m["info"].get("role") == "assistant"
+            ]
+            if replies:
+                return _error_text(replies[-1])
             await asyncio.sleep(poll_interval)
-        return False
+        return f"session did not start running within {int(timeout)}s (check agent/model/provider config)"
+
+
+def _error_text(message_info: dict) -> Optional[str]:
+    error = message_info.get("error")
+    if not error:
+        return None
+    return (error.get("data") or {}).get("message") or error.get("name") or str(error)

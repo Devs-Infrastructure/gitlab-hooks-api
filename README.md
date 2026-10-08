@@ -223,6 +223,7 @@ curl -X POST "$GITLAB_HOST/api/v4/projects/$PROJECT_ID/trigger/pipeline" \
 Drives an OpenCode server through its HTTP API. Only comments on merge requests that **start with** `OPENCODE_TRIGGER_PHRASE` (default `boss`) are handled, e.g. `boss fix the failing test`.
 
 - **One session per MR.** `project_id + mr_iid → session_id` is stored in MongoDB (`opencode_sessions`) and reused. If the session no longer exists on the server, a new one is created.
+- **Full permissions.** Sessions are created with an allow-all permission ruleset (`[{"permission": "*", "pattern": "*", "action": "allow"}]`), so unattended runs never block on approval prompts.
 - **First request** creates the session (`POST /session`) and sends the initial instruction via `POST /session/:id/prompt_async`: read the MR with `glab`, create/reuse `.worktrees/mr-<iid>-<source-branch>`, verify it is on the MR source branch, do the smallest change, test, commit and push to the MR branch.
 - **Later requests** reuse the session with `New instruction for <MR_URL>: <request>. Refresh relevant context with glab and continue in the existing MR worktree.`
 - **Retries are deduplicated** by GitLab note id (`opencode_events` collection).

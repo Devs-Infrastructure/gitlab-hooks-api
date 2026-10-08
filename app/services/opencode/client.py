@@ -7,6 +7,9 @@ import httpx
 
 from app.config import OPENCODE_HOST, OPENCODE_USERNAME, OPENCODE_PASSWORD
 
+# Session permission ruleset (`PermissionRuleset` in the OpenCode API schema): allow every tool on every pattern.
+ALLOW_ALL_PERMISSIONS = [{"permission": "*", "pattern": "*", "action": "allow"}]
+
 
 class OpenCodeAPIError(Exception):
     """Raised when the OpenCode server returns an error."""
@@ -48,8 +51,12 @@ class OpenCodeClient:
         return response
 
     async def create_session(self, title: str, directory: Optional[str] = None) -> dict:
-        """Create a new session. Returns the session object (with `id`)."""
-        response = await self._request("POST", "/session", directory, json={"title": title})
+        """Create a new session with every permission allowed, so runs never stop on approval prompts.
+
+        Returns the session object (with `id`).
+        """
+        body = {"title": title, "permission": ALLOW_ALL_PERMISSIONS}
+        response = await self._request("POST", "/session", directory, json=body)
         return response.json()
 
     async def session_exists(self, session_id: str, directory: Optional[str] = None) -> bool:

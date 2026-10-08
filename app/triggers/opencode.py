@@ -10,6 +10,8 @@ from app.config import (
     OPENCODE_GITLAB_TOKEN,
     OPENCODE_INITIAL_PROMPT,
     OPENCODE_MODEL,
+    OPENCODE_REVIEW_ON_OPEN,
+    OPENCODE_REVIEW_PROMPT,
     OPENCODE_RUN_TIMEOUT,
     OPENCODE_SESSION_URL,
     OPENCODE_START_TIMEOUT,
@@ -42,6 +44,22 @@ def session_link(session_id: str, directory: str | None) -> str:
     return f"[`{session_id}`]({url})"
 
 
+def _job(project_id: int, flow_context: dict, ref: str) -> dict:
+    project = flow_context.get("project", {})
+    mr = flow_context.get("merge_request", {})
+    return {
+        "project_id": project_id,
+        "path_with_namespace": project.get("path_with_namespace") or "",
+        "mr_iid": mr["iid"],
+        "mr_title": mr.get("title") or "",
+        "mr_url": mr.get("url") or "",
+        "source_branch": mr.get("source_branch") or ref,
+        "target_branch": mr.get("target_branch") or "",
+        "request": "",
+        "discussion_id": None,
+    }
+
+
 class OpenCodeTrigger(BaseTrigger):
     """Sends MR instructions to a per-MR OpenCode session via `prompt_async`."""
 
@@ -56,6 +74,7 @@ class OpenCodeTrigger(BaseTrigger):
         start_timeout: int = OPENCODE_START_TIMEOUT,
         gitlab: GitLabClient | None = None,
         gitlab_token: str = OPENCODE_GITLAB_TOKEN,
+        review_on_open: bool = OPENCODE_REVIEW_ON_OPEN,
     ):
         self._client = client or OpenCodeClient()
         self._gitlab = gitlab or GitLabClient()
@@ -66,6 +85,7 @@ class OpenCodeTrigger(BaseTrigger):
         self._model = model or None
         self._run_timeout = run_timeout
         self._start_timeout = start_timeout
+        self._review_on_open = review_on_open
 
     def matches(self, note: str) -> bool:
         return bool(self._pattern.match(note or ""))
@@ -93,18 +113,25 @@ class OpenCodeTrigger(BaseTrigger):
             print(f"[OpenCodeTrigger] Duplicate delivery of {event_key}, ignoring.")
             return {"skipped": "duplicate"}
 
-        project = flow_context.get("project", {})
-        job = {
-            "project_id": project_id,
-            "path_with_namespace": project.get("path_with_namespace") or "",
-            "mr_iid": mr["iid"],
-            "mr_title": mr.get("title") or "",
-            "mr_url": mr.get("url") or "",
-            "source_branch": mr.get("source_branch") or ref,
-            "request": request,
-            "discussion_id": note.get("discussion_id"),
-        }
-        mr_key = f"{project_id}:{mr['iid']}"
+        job = _job(project_id, flow_context, ref)
+        job.update(request=request, discussion_id=note.get("discussion_id"))
+        return await self._queue(job)
+
+    async def on_merge_request_opened(self, project_id: int, flow_context: dict) -> dict | None:
+        if not self._review_on_open:
+            return None
+        mr = flow_context.get("merge_request", {})
+        if not mr.get("iid"):
+            return {"skipped": "not_a_merge_request"}
+        if not await claim_event(f"mr-open:{project_id}:{mr['iid']}"):
+            print(f"[OpenCodeTrigger] Duplicate open event for MR {project_id}:{mr['iid']}, ignoring.")
+            return {"skipped": "duplicate"}
+        job = _job(project_id, flow_context, mr.get("source_branch") or "")
+        job["review"] = True
+        return await self._queue(job)
+
+    async def _queue(self, job: dict) -> dict:
+        mr_key = f"{job['project_id']}:{job['mr_iid']}"
         worker = _workers.get(mr_key)
         waiting = worker is not None and not worker.done()
         position = self._enqueue(mr_key, job)
@@ -115,14 +142,16 @@ class OpenCodeTrigger(BaseTrigger):
         return {"status": "queued", "merge_request": mr_key, "position": position}
 
     async def _reply(self, job: dict, text: str):
-        """Answer the triggering MR comment. Never raises."""
+        """Answer in the job's thread, opening one on first reply if needed. Never raises."""
         if not self._gitlab_token:
             return
         try:
-            await self._gitlab.create_mr_note(
+            created = await self._gitlab.create_mr_note(
                 self._gitlab_token, job["project_id"], job["mr_iid"], text,
                 discussion_id=job.get("discussion_id"),
             )
+            if not job.get("discussion_id"):
+                job["discussion_id"] = created.get("id")
         except Exception as e:
             print(f"[OpenCodeTrigger] MR {job['project_id']}:{job['mr_iid']}: "
                   f"failed to post reply: {e}")
@@ -162,13 +191,14 @@ class OpenCodeTrigger(BaseTrigger):
         repo_dir = "." if self._directory_template else job["path_with_namespace"]
         worktree = worktree_path(repo_dir, mr_iid, job["source_branch"])
         prompt_vars = {**job, "repo_dir": repo_dir, "worktree": worktree}
+        review_prompt = OPENCODE_REVIEW_PROMPT if job.get("review") else None
 
         stored = await get_mr_session(project_id, mr_iid)
         session_id = stored and stored.get("session_id")
         directory = stored.get("directory") if stored else self._directory(job)
 
         if session_id and await self._client.session_exists(session_id, directory):
-            text = OPENCODE_FOLLOWUP_PROMPT.format(**prompt_vars)
+            text = (review_prompt or OPENCODE_FOLLOWUP_PROMPT).format(**prompt_vars)
             print(f"[OpenCodeTrigger] MR {project_id}:{mr_iid}: reusing session {session_id}")
         else:
             directory = self._directory(job)
@@ -185,7 +215,7 @@ class OpenCodeTrigger(BaseTrigger):
                 "source_branch": job["source_branch"],
                 "worktree": worktree,
             })
-            text = OPENCODE_INITIAL_PROMPT.format(**prompt_vars)
+            text = (review_prompt or OPENCODE_INITIAL_PROMPT).format(**prompt_vars)
             print(f"[OpenCodeTrigger] MR {project_id}:{mr_iid}: created session {session_id}")
 
         job["session_id"], job["directory"] = session_id, directory
@@ -209,7 +239,8 @@ class OpenCodeTrigger(BaseTrigger):
             await self._reply(job, f"❌ OpenCode failed to start in session {link}: {error}")
             return
         print(f"[OpenCodeTrigger] MR {project_id}:{mr_iid}: session {session_id} started")
-        await self._reply(job, f"🚀 OpenCode started working on this in session {link}.")
+        task = "reviewing this MR" if job.get("review") else "working on this"
+        await self._reply(job, f"🚀 OpenCode started {task} in session {link}.")
 
         await self._client.wait_until_idle(session_id, directory, timeout=self._run_timeout)
         error = await self._client.last_error(session_id, directory)

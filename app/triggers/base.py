@@ -8,6 +8,10 @@ class BaseTrigger(abc.ABC):
     def matches(self, note: str) -> bool:
         return CODE_PHRASE in (note or "")
 
+    async def on_merge_request_opened(self, project_id: int, flow_context: dict) -> dict | None:
+        """Handle a newly opened MR. Returns None when the trigger ignores it."""
+        return None
+
     @abc.abstractmethod
     async def fire(
         self,

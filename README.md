@@ -15,6 +15,11 @@ POST /gitlab/webhook
 Trigger dispatcher
     ├─ gitlab_pipeline → triggers GitLab CI pipeline with AI_FLOW_* variables
     └─ opencode        → MR comments starting with "boss" → per-MR OpenCode session
+
+GitLab MR opened or marked ready, drafts skipped (merge_requests_events)
+    ▼
+POST /gitlab/webhook
+    └─ opencode        → review prompt sent to the MR's OpenCode session (OPENCODE_REVIEW_ON_OPEN)
 ```
 
 ### Registration flow
@@ -60,7 +65,9 @@ When GitLab POSTs a webhook event:
 | `OPENCODE_START_TIMEOUT` | no | `60` | Seconds to wait for a sent prompt to start running before it is reported as failed |
 | `OPENCODE_GITLAB_TOKEN` | no | — | GitLab token (`api` scope) used to reply to the triggering comment with the session link or failure. Empty = no replies |
 | `OPENCODE_SESSION_URL` | no | — | Session link template for those replies; placeholders `{session_id}`, `{directory}`, e.g. `https://coder.the-devs.com/server/<base64 server URL>/session/{session_id}`. Empty = session id only |
-| `OPENCODE_INITIAL_PROMPT` / `OPENCODE_FOLLOWUP_PROMPT` | no | *(built-in)* | Prompt templates; placeholders `{mr_url}`, `{mr_iid}`, `{source_branch}`, `{path_with_namespace}`, `{repo_dir}`, `{worktree}`, `{request}` |
+| `OPENCODE_INITIAL_PROMPT` / `OPENCODE_FOLLOWUP_PROMPT` | no | *(built-in)* | Prompt templates; placeholders `{mr_url}`, `{mr_iid}`, `{project_id}`, `{source_branch}`, `{target_branch}`, `{path_with_namespace}`, `{repo_dir}`, `{worktree}`, `{request}` |
+| `OPENCODE_REVIEW_ON_OPEN` | no | `true` | Send MRs to OpenCode for review when opened (non-draft) or marked ready. Requires `merge_requests_events: true` on the webhook |
+| `OPENCODE_REVIEW_PROMPT` | no | *(built-in)* | Review prompt template; same placeholders as above except `{request}`. Default: review for correctness, security, codebase fit/reuse and leftover garbage, and post findings as inline comments on the exact lines via `glab api` |
 
 ### `.env` example
 
@@ -221,10 +228,12 @@ Drives an OpenCode server through its HTTP API. Only comments on merge requests 
 - **Retries are deduplicated** by GitLab note id (`opencode_events` collection).
 - **Requests are serialized per MR**: the webhook returns `{"status": "queued"}` immediately; a background worker sends the next prompt only after the session is idle again (polled via `GET /session/status`). The queue lives in memory, so run a single uvicorn worker and note that queued-but-unsent requests are lost on restart.
 
-- **Status replies** (requires `OPENCODE_GITLAB_TOKEN`): the bot answers in the thread of the triggering comment with
+- **Status replies** (requires `OPENCODE_GITLAB_TOKEN`): the bot answers in the thread of the triggering comment (for reviews, in a thread it opens on the first status) with
   - `⏳ Queued (#N)` immediately, when another request for the MR is still running;
   - `🚀 OpenCode started working on this in session <link>` as soon as the session is busy (or has replied);
   - `❌ OpenCode failed ...` when the server is unreachable, the session can't be created, the reply errors (e.g. provider auth), nothing starts within `OPENCODE_START_TIMEOUT`, or the run ends with an error.
+
+- **Review on open** (`OPENCODE_REVIEW_ON_OPEN`, on by default): when an MR is opened as non-draft or a draft is marked ready, `OPENCODE_REVIEW_PROMPT` is queued in the MR's session (created if needed). OpenCode reads the diff and surrounding code without editing, posts each finding as an inline discussion on the exact changed line, then a short summary note. Later `boss ...` comments continue in the same session. Each MR is reviewed once; repeats are ignored (`mr-open:<project>:<iid>` in `opencode_events`). Requires `merge_requests_events: true` when registering webhooks.
 
 The OpenCode host needs the repository checked out (see `OPENCODE_DIRECTORY`) and an authenticated `glab`.
 

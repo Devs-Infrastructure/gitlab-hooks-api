@@ -44,3 +44,21 @@ OPENCODE_FOLLOWUP_PROMPT = config("OPENCODE_FOLLOWUP_PROMPT", default=(
     "New instruction for {mr_url}: {request}. "
     "Refresh relevant context with glab and continue in the existing MR worktree ({worktree})."
 ))
+
+# Review newly opened MRs (needs merge_requests_events on the webhook).
+OPENCODE_REVIEW_ON_OPEN = config("OPENCODE_REVIEW_ON_OPEN", default=True, cast=bool)
+OPENCODE_REVIEW_PROMPT = config("OPENCODE_REVIEW_PROMPT", default=(
+    "Review {mr_url} ({source_branch} -> {target_branch}). Read the MR and diff with glab; "
+    "check out {source_branch} in {worktree} (repo {repo_dir}, clone {path_with_namespace} if missing) "
+    "and read the surrounding code. Do not edit, commit or push - unless asked.\n\n"
+    "Report only real problems, most important first:\n"
+    "1. Correctness: logic errors, edge cases, error handling, races.\n"
+    "2. Security: injection, auth gaps, leaked secrets, unsafe input.\n"
+    "3. Codebase fit: duplicates existing helpers, breaks established patterns.\n"
+    "4. Garbage: dead code, debug leftovers, unrelated changes.\n"
+    "No style nitpicks.\n\n"
+    "Post each finding (problem + fix) as an inline comment on the exact line: glab api POST "
+    "projects/{project_id}/merge_requests/{mr_iid}/discussions with a text position "
+    "(diff_refs SHAs; new_path/new_line, or old_path/old_line for removed lines). "
+    "End with one short summary note."
+))

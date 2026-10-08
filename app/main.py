@@ -464,7 +464,10 @@ async def receive_gitlab_webhook(request: Request):
 
     # Parse JSON payload
     body = await request.json()
-    
+
+    if body.get("object_kind") == "merge_request":
+        return await handle_merge_request_event(body)
+
     # Extract comment text from webhook payload
     # GitLab comment events typically have the note in object_attributes.note
     note = body.get("object_attributes", {}).get("note", "")
@@ -572,3 +575,45 @@ async def receive_gitlab_webhook(request: Request):
 
     return {"found": found}
 
+
+
+async def handle_merge_request_event(body: dict):
+    """Dispatch MRs that become ready for review (opened non-draft, or marked ready) to triggers."""
+    attrs = body.get("object_attributes", {})
+    draft_change = body.get("changes", {}).get("draft", {})
+    opened = attrs.get("action") == "open" and not attrs.get("draft")
+    marked_ready = attrs.get("action") == "update" and draft_change.get("previous") and not draft_change.get("current")
+    if not (opened or marked_ready):
+        return {"found": False}
+
+    project = body.get("project", {})
+    project_id = project.get("id")
+    if not project_id:
+        print("[Webhook] Project ID not found in merge request payload.")
+        return {"found": False}
+
+    flow_context = {
+        "event": "merge_request",
+        "project": {
+            "id": project_id,
+            "name": project.get("name"),
+            "path_with_namespace": project.get("path_with_namespace"),
+            "web_url": project.get("web_url"),
+        },
+        "merge_request": {
+            "iid": attrs.get("iid"),
+            "title": attrs.get("title"),
+            "source_branch": attrs.get("source_branch"),
+            "target_branch": attrs.get("target_branch"),
+            "url": attrs.get("url"),
+        },
+    }
+
+    results = []
+    for trigger in get_triggers():
+        result = await trigger.on_merge_request_opened(project_id, flow_context)
+        if result is not None:
+            results.append(result)
+    if results:
+        print(f"[Webhook] MR !{attrs.get('iid')} ready for review in project {project_id}: {results}")
+    return {"found": bool(results), "trigger_results": results}
